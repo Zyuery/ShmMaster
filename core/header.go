@@ -12,6 +12,7 @@ type header struct {
 	KeyLen uint16
 	_      uint16 // reserved/pad
 	ValLen uint32
+	ValOff uint64
 	CRC32  uint32
 }
 
@@ -21,8 +22,10 @@ func decodeHeader(data []byte) header {
 		Ver:    binary.LittleEndian.Uint16(data[4:6]),
 		Flags:  binary.LittleEndian.Uint16(data[6:8]),
 		KeyLen: binary.LittleEndian.Uint16(data[8:10]),
+		//_:      binary.LittleEndian.Uint16(data[10:12]),
 		ValLen: binary.LittleEndian.Uint32(data[12:16]),
-		CRC32:  binary.LittleEndian.Uint32(data[16:20]),
+		ValOff: binary.LittleEndian.Uint64(data[16:24]),
+		CRC32:  binary.LittleEndian.Uint32(data[24:28]),
 	}
 }
 
@@ -33,15 +36,17 @@ func encodeHeader(b []byte, h header) {
 	binary.LittleEndian.PutUint16(b[8:10], h.KeyLen)
 	binary.LittleEndian.PutUint16(b[10:12], 0)
 	binary.LittleEndian.PutUint32(b[12:16], h.ValLen)
-	binary.LittleEndian.PutUint32(b[16:20], h.CRC32)
+	binary.LittleEndian.PutUint64(b[16:24], h.ValOff)
+	binary.LittleEndian.PutUint32(b[24:28], h.CRC32)
 }
 
-func calcCRC(flags uint16, keyLen uint16, valLen uint32, key, val []byte) uint32 {
+func calcCRC(flags uint16, keyLen uint16, valLen uint32, valOff uint64, key, val []byte) uint32 {
 	// 把一部分头字段 + key + val 做校验 ；注意：不要把 Magic/Ver/CRC 自己算进去也行，但必须读写一致
-	var tmp [2 + 2 + 4]byte
+	var tmp [2 + 2 + 4 + 8]byte
 	binary.LittleEndian.PutUint16(tmp[0:2], flags)
 	binary.LittleEndian.PutUint16(tmp[2:4], keyLen)
 	binary.LittleEndian.PutUint32(tmp[4:8], valLen)
+	binary.LittleEndian.PutUint64(tmp[8:16], valOff)
 
 	c := crc32.NewIEEE()
 	_, _ = c.Write(tmp[:])

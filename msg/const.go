@@ -6,9 +6,13 @@ const (
 	Version    = uint16(1)
 	FlagPut    = uint16(1)
 	FlagDel    = uint16(2)
-	HeaderSize = 4 + 2 + 2 + 2 + 2 + 4 + 4 // 20 bytes（含 reserved）
+	HeaderSize = 4 + 2 + 2 + 2 + 2 + 4 + 8 + 4 // 20 bytes（含 reserved）
 )
 
 const (
 	ShardSize = 32
+)
+
+const (
+	Align = 1 << 4
 )

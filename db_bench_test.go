@@ -27,7 +27,7 @@ func warmupKeys(b *testing.B, db *core.DB, n int) {
 }
 
 func BenchmarkGetParallel(b *testing.B) {
-	db := mustOpenBenchDB(b, "bench.data", 1<<30)
+	db := mustOpenBenchDB(b, "bench.data", 128<<20)
 	defer db.Close()
 
 	//warmupKeys(b, db, 100_000)
@@ -43,7 +43,7 @@ func BenchmarkGetParallel(b *testing.B) {
 }
 
 func BenchmarkMix9010Parallel(b *testing.B) {
-	db := mustOpenBenchDB(b, "bench.data", 1<<30)
+	db := mustOpenBenchDB(b, "bench.data", 128<<20)
 	defer db.Close()
 
 	warmupKeys(b, db, 100_000)
@@ -63,7 +63,7 @@ func BenchmarkMix9010Parallel(b *testing.B) {
 }
 
 func BenchmarkMix5050Parallel(b *testing.B) {
-	db := mustOpenBenchDB(b, "bench.data", 1<<30)
+	db := mustOpenBenchDB(b, "bench.data", 128<<20)
 	defer db.Close()
 
 	//warmupKeys(b, db, 100_000)
@@ -83,7 +83,7 @@ func BenchmarkMix5050Parallel(b *testing.B) {
 }
 
 func BenchmarkSetParallel(b *testing.B) {
-	db := mustOpenBenchDB(b, "bench.data", 1<<30)
+	db := mustOpenBenchDB(b, "bench.data", 128<<20)
 	defer db.Close()
 
 	b.ResetTimer()
