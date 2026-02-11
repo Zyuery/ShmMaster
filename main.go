@@ -46,5 +46,4 @@ func main() {
 		}
 		fmt.Println(ok, got.ID, got.HP, string(got.Name[:]))
 	}
-	return
 }

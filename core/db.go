@@ -2,13 +2,29 @@ package core
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"md_master/msg"
 	"md_master/util"
 	"os"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+// #region agent log
+func debugLog(loc, msg string, data map[string]interface{}, hyp string) {
+	d := map[string]interface{}{"location": loc, "message": msg, "data": data, "timestamp": time.Now().UnixMilli(), "hypothesisId": hyp}
+	if b, err := json.Marshal(d); err == nil {
+		f, _ := os.OpenFile("/Users/zyuer/GolandProjects/md_master/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if f != nil {
+			f.Write(append(b, '\n'))
+			f.Close()
+		}
+	}
+}
+
+// #endregion
 
 type Entry struct {
 	ValOff uint64
@@ -29,8 +45,8 @@ type DB struct {
 	mu     sync.Mutex
 	shards []shard
 
-	// allocator freelist：按 size class 存 offset
-	free map[uint32][]uint64
+	free  map[uint32][]uint64 // size class -> offsets
+	truth map[uint64]uint32   // offset -> size class
 }
 
 func NewDB(f *os.File, data []byte, shardN int64) *DB {
@@ -45,6 +61,7 @@ func NewDB(f *os.File, data []byte, shardN int64) *DB {
 		mu:     sync.Mutex{},
 		shards: shards,
 		free:   make(map[uint32][]uint64),
+		truth:  make(map[uint64]uint32),
 		logEnd: 0,
 		valEnd: uint64(len(data)),
 	}
@@ -80,82 +97,125 @@ func (db *DB) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	var err error
 	if db.data != nil {
-		_ = unix.Munmap(db.data)
+		if e := unix.Msync(db.data, unix.MS_SYNC); err == nil {
+			err = e
+		}
+		if e := unix.Munmap(db.data); err == nil {
+			err = e
+		}
 		db.data = nil
 	}
 	if db.f != nil {
-		_ = db.f.Close()
+		if e := db.f.Close(); err == nil {
+			err = e
+		}
 		db.f = nil
 	}
-	return nil
+
+	db.free = nil
+	db.truth = nil
+	db.shards = nil
+	return err
 }
 
 // Recover 恢复索引，更新logEnd、valEnd
 func (db *DB) Recover() error {
+	if db.free == nil {
+		db.free = make(map[uint32][]uint64)
+	} else {
+		for k := range db.free {
+			delete(db.free, k)
+		}
+	}
+	if db.truth == nil {
+		db.truth = make(map[uint64]uint32)
+	} else {
+		for k := range db.truth {
+			delete(db.truth, k)
+		}
+	}
 	var off uint64 = 0
 	fileLimit := uint64(len(db.data))
 	minValOff := fileLimit
+	recordsApplied := 0
 	for {
 		//不够一个记录头
 		if off+msg.HeaderSize > minValOff {
+			debugLog("db.go:Recover", "break: off+HeaderSize>minValOff", map[string]interface{}{"off": off, "minValOff": minValOff, "recordsApplied": recordsApplied}, "C")
 			break
 		}
 		h := decodeHeader(db.data[off : off+msg.HeaderSize])
 		//校验头
 		if h.Magic != msg.Magic {
+			debugLog("db.go:Recover", "break: Magic mismatch", map[string]interface{}{"off": off, "gotMagic": h.Magic, "recordsApplied": recordsApplied}, "C")
 			break
 		}
 		if h.Ver != msg.Version {
+			debugLog("db.go:Recover", "break: Version mismatch", map[string]interface{}{"off": off, "gotVer": h.Ver, "recordsApplied": recordsApplied}, "C")
 			break
 		}
 		//长度校验
 		if h.KeyLen == 0 {
+			debugLog("db.go:Recover", "break: KeyLen==0", map[string]interface{}{"off": off, "recordsApplied": recordsApplied}, "C")
 			break
 		}
 		recordLen := uint64(msg.HeaderSize) + uint64(h.KeyLen)
 		if off+recordLen > minValOff {
+			debugLog("db.go:Recover", "break: off+recordLen>minValOff", map[string]interface{}{"off": off, "recordLen": recordLen, "minValOff": minValOff, "recordsApplied": recordsApplied}, "D")
 			break
 		}
 		//校验CRC
 		keyStart := off + msg.HeaderSize
 		keyBytes := db.data[keyStart : keyStart+uint64(h.KeyLen)]
-		var valBytes []byte
+		var valBytes []byte = nil
 		if h.Flags == msg.FlagPut {
 			if h.ValOff > fileLimit || uint64(h.ValLen) > fileLimit || h.ValOff+uint64(h.ValLen) > fileLimit {
+				debugLog("db.go:Recover", "break: ValOff/ValLen bounds", map[string]interface{}{"off": off, "ValOff": h.ValOff, "ValLen": h.ValLen, "fileLimit": fileLimit, "recordsApplied": recordsApplied}, "C")
 				break
 			}
 			if h.ValOff < off+recordLen {
+				debugLog("db.go:Recover", "break: ValOff<off+recordLen", map[string]interface{}{"off": off, "ValOff": h.ValOff, "recordLen": recordLen, "recordsApplied": recordsApplied}, "C")
 				break
 			}
 			valBytes = db.data[h.ValOff : h.ValOff+uint64(h.ValLen)]
-			if h.ValOff < minValOff {
-				minValOff = h.ValOff
-			}
 		}
 		if calcCRC(h.Flags, h.KeyLen, h.ValLen, h.ValOff, keyBytes, valBytes) != h.CRC32 {
+			debugLog("db.go:Recover", "break: CRC mismatch", map[string]interface{}{"off": off, "key": string(keyBytes), "flags": h.Flags, "recordsApplied": recordsApplied}, "B")
 			break
+		}
+		if h.ValOff < minValOff {
+			minValOff = h.ValOff
 		}
 		// 校验通过，更新索引
 		k := string(keyBytes)
 		sid := util.Str2Int(k, msg.ShardSize)
 		shard := &db.shards[sid]
-		//oldEntity, hadOld := shard.idx[k]
-		//if hadOld {
-		//	db.FreeBlock(oldEntity.ValOff, oldEntity.ValLen)
-		//}
+		oldEntity, hadOld := shard.idx[k]
 		switch h.Flags {
 		case msg.FlagPut:
+			if hadOld {
+				db.FreeBlock(oldEntity.ValOff, oldEntity.ValLen)
+			}
+			db.MarkUsed(h.ValOff) //标记占用真相
 			shard.idx[k] = Entry{ValOff: h.ValOff, ValLen: h.ValLen}
+			recordsApplied++
 		case msg.FlagDel:
+			if hadOld {
+				db.FreeBlock(oldEntity.ValOff, oldEntity.ValLen)
+			}
 			delete(shard.idx, k)
+			recordsApplied++
 		default:
-			return nil //未知flag
+			debugLog("db.go:Recover", "unknown Flags, break", map[string]interface{}{"off": off, "flags": h.Flags, "key": k, "recordsApplied": recordsApplied}, "A")
+			break //未知flag
 		}
 		off += recordLen
 	}
 	db.logEnd = off
 	db.valEnd = minValOff
+	debugLog("db.go:Recover", "Recover done", map[string]interface{}{"logEnd": off, "valEnd": minValOff, "recordsApplied": recordsApplied, "fileLimit": fileLimit}, "E")
 	return nil
 }
 
@@ -165,7 +225,10 @@ func (db *DB) Set(key string, value []byte) error {
 	}
 	keyLen := len(key)
 	valueLen := uint32(len(value))
-	if keyLen > int(^uint16(0)) || valueLen > ^uint32(0) {
+	if keyLen > int(^uint16(0)) || len(value) > int(^uint32(0)) {
+		return msg.ErrBadArgument
+	}
+	if valueLen == 0 {
 		return msg.ErrBadArgument
 	}
 	recTotal := uint64(msg.HeaderSize) + uint64(keyLen)
@@ -173,7 +236,7 @@ func (db *DB) Set(key string, value []byte) error {
 	//写value入value区
 	db.mu.Lock()
 	var valOff uint64
-	off, ok := db.Alloc(valueLen)
+	off, ok := db.Alloc(valueLen, recTotal)
 	if !ok {
 		db.mu.Unlock()
 		return msg.ErrNoSpace
@@ -182,10 +245,6 @@ func (db *DB) Set(key string, value []byte) error {
 	copy(db.data[valOff:valOff+uint64(valueLen)], value)
 
 	//追加log record进log区
-	if db.logEnd+recTotal > db.valEnd {
-		db.mu.Unlock()
-		return msg.ErrNoSpace
-	}
 	off = db.logEnd
 	//写log Header
 	h := header{
@@ -242,9 +301,10 @@ func (db *DB) Get(key string) ([]byte, bool, error) {
 	}
 	start := e.ValOff
 	end := start + uint64(e.ValLen)
-	//if end > uint64(len(db.data)) {
-	//	return nil, false, msg.ErrNoSpace
-	//}
+	if end > uint64(len(db.data)) || start < db.valEnd {
+		debugLog("db.go:Get", "ErrNoSpace: val bounds reject", map[string]interface{}{"key": key, "start": start, "end": end, "valEnd": db.valEnd, "dataLen": len(db.data), "condEnd": end > uint64(len(db.data)), "condStart": start < db.valEnd}, "E")
+		return nil, false, msg.ErrNoSpace // 或 ErrCorrupt
+	}
 	//拷贝返回，避免调用方误改 mmap 区
 	v := append([]byte(nil), db.data[start:end]...)
 	return v, true, nil
@@ -283,14 +343,13 @@ func (db *DB) Del(key string) error {
 	//写keyBytes
 	copy(db.data[keyStart:keyStart+uint64(h.KeyLen)], key)
 	keyBytes := db.data[keyStart : keyStart+uint64(h.KeyLen)]
-	valBytes := db.data[keyStart+uint64(h.ValLen):]
 	crc := calcCRC(
 		msg.FlagDel,
 		h.KeyLen,
 		0,
 		0,
 		keyBytes,
-		valBytes)
+		nil)
 	binary.LittleEndian.PutUint32(db.data[off+24:off+28], crc)
 	//（可选）为了 crash 测试更稳定，可以强刷一下
 	//_ = unix.Msync(db.data[off:off+recTotal], unix.MS_SYNC)
@@ -299,49 +358,68 @@ func (db *DB) Del(key string) error {
 	//释放旧value内存
 	sid := util.Str2Int(key, msg.ShardSize)
 	shard := &db.shards[sid]
-	shard.rw.RLock()
+	shard.rw.Lock()
 	oldEntity, hadOld := shard.idx[key]
 	if hadOld { //释放该key旧value的内存
 		db.FreeBlock(oldEntity.ValOff, oldEntity.ValLen)
 	}
-	shard.rw.RUnlock()
+	//删除索引
+	delete(shard.idx, key)
+	shard.rw.Unlock()
 
 	db.mu.Unlock()
-
-	//删除索引
-	shard.rw.Lock()
-	defer shard.rw.Unlock()
-
-	delete(db.shards[sid].idx, key)
 	return nil
 }
 
-// Alloc 分配内存，不命中空闲区则更新valEnd，必须在db.mu.Lock()保护下调用
-func (db *DB) Alloc(n uint32) (off uint64, ok bool) {
+// Alloc 分配内存，不命中空闲区则更新valEnd，必须在db.mu.Lock()保护下或单线程调用
+func (db *DB) Alloc(n uint32, logNeed uint64) (off uint64, ok bool) {
 	c := util.SizeClass(n)
 	if c == 0 {
-		return 0, true
-	}
-	//复用freelist空闲值区
-	if ptrList, ok := db.free[c]; ok && len(ptrList) > 0 {
-		freeValOff := ptrList[len(ptrList)-1]
-		db.free[c] = ptrList[:len(ptrList)-1]
-		return freeValOff, true
-	}
-	//无空闲，则分配新区
-	need := uint64(c)
-	if db.valEnd < need || db.valEnd-need < db.logEnd {
 		return 0, false
 	}
-	db.valEnd -= need
+	// 1)查freelist
+	if db.logEnd+logNeed <= db.valEnd { //有空闲区
+		stack := db.free[c]
+		for len(stack) > 0 {
+			off = stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			if cls, ok := db.truth[off]; ok && cls == c {
+				delete(db.truth, off)
+				db.free[c] = stack
+				return off, true
+			}
+		}
+		db.free[c] = stack
+	} else {
+		return 0, false
+	}
+	// tail 分配
+	need := uint64(c)
+	if db.valEnd < need {
+		return 0, false
+	}
+	newValEnd := db.valEnd - need
+	if db.logEnd+logNeed > newValEnd {
+		return 0, false
+	}
+	db.valEnd = newValEnd
 	return db.valEnd, true
 }
 
-// FreeBlock 释放块内存，加入空闲区，必须在db.mu.Lock()保护下调用
+// FreeBlock 释放块内存，加入空闲区，必须在db.mu.Lock()保护下或单线程调用
 func (db *DB) FreeBlock(off uint64, n uint32) {
 	c := util.SizeClass(n)
 	if c == 0 {
 		return
 	}
+	if cls, ok := db.truth[off]; ok && cls == c {
+		return // 已经 free 过了，拒绝 double-free
+	}
+	db.truth[off] = c
 	db.free[c] = append(db.free[c], off)
+}
+
+// MarkUsed 标记内存已使用，必须在db.mu.Lock()保护下或单线程调用
+func (db *DB) MarkUsed(off uint64) {
+	delete(db.truth, off)
 }
