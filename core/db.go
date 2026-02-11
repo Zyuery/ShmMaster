@@ -2,29 +2,13 @@ package core
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"md_master/msg"
 	"md_master/util"
 	"os"
 	"sync"
-	"time"
 
 	"golang.org/x/sys/unix"
 )
-
-// #region agent log
-func debugLog(loc, msg string, data map[string]interface{}, hyp string) {
-	d := map[string]interface{}{"location": loc, "message": msg, "data": data, "timestamp": time.Now().UnixMilli(), "hypothesisId": hyp}
-	if b, err := json.Marshal(d); err == nil {
-		f, _ := os.OpenFile("/Users/zyuer/GolandProjects/md_master/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if f != nil {
-			f.Write(append(b, '\n'))
-			f.Close()
-		}
-	}
-}
-
-// #endregion
 
 type Entry struct {
 	ValOff uint64
@@ -42,7 +26,7 @@ type DB struct {
 	logEnd uint64
 	valEnd uint64
 
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	shards []shard
 
 	free  map[uint32][]uint64 // size class -> offsets
@@ -58,7 +42,7 @@ func NewDB(f *os.File, data []byte, shardN int64) *DB {
 	return &DB{
 		f:      f,
 		data:   data,
-		mu:     sync.Mutex{},
+		mu:     sync.RWMutex{},
 		shards: shards,
 		free:   make(map[uint32][]uint64),
 		truth:  make(map[uint64]uint32),
@@ -139,53 +123,43 @@ func (db *DB) Recover() error {
 	var off uint64 = 0
 	fileLimit := uint64(len(db.data))
 	minValOff := fileLimit
-	recordsApplied := 0
+Loop:
 	for {
 		//不够一个记录头
 		if off+msg.HeaderSize > minValOff {
-			debugLog("db.go:Recover", "break: off+HeaderSize>minValOff", map[string]interface{}{"off": off, "minValOff": minValOff, "recordsApplied": recordsApplied}, "C")
 			break
 		}
 		h := decodeHeader(db.data[off : off+msg.HeaderSize])
 		//校验头
 		if h.Magic != msg.Magic {
-			debugLog("db.go:Recover", "break: Magic mismatch", map[string]interface{}{"off": off, "gotMagic": h.Magic, "recordsApplied": recordsApplied}, "C")
 			break
 		}
 		if h.Ver != msg.Version {
-			debugLog("db.go:Recover", "break: Version mismatch", map[string]interface{}{"off": off, "gotVer": h.Ver, "recordsApplied": recordsApplied}, "C")
 			break
 		}
 		//长度校验
 		if h.KeyLen == 0 {
-			debugLog("db.go:Recover", "break: KeyLen==0", map[string]interface{}{"off": off, "recordsApplied": recordsApplied}, "C")
 			break
 		}
 		recordLen := uint64(msg.HeaderSize) + uint64(h.KeyLen)
 		if off+recordLen > minValOff {
-			debugLog("db.go:Recover", "break: off+recordLen>minValOff", map[string]interface{}{"off": off, "recordLen": recordLen, "minValOff": minValOff, "recordsApplied": recordsApplied}, "D")
 			break
 		}
 		//校验CRC
 		keyStart := off + msg.HeaderSize
 		keyBytes := db.data[keyStart : keyStart+uint64(h.KeyLen)]
-		var valBytes []byte = nil
 		if h.Flags == msg.FlagPut {
 			if h.ValOff > fileLimit || uint64(h.ValLen) > fileLimit || h.ValOff+uint64(h.ValLen) > fileLimit {
-				debugLog("db.go:Recover", "break: ValOff/ValLen bounds", map[string]interface{}{"off": off, "ValOff": h.ValOff, "ValLen": h.ValLen, "fileLimit": fileLimit, "recordsApplied": recordsApplied}, "C")
 				break
 			}
 			if h.ValOff < off+recordLen {
-				debugLog("db.go:Recover", "break: ValOff<off+recordLen", map[string]interface{}{"off": off, "ValOff": h.ValOff, "recordLen": recordLen, "recordsApplied": recordsApplied}, "C")
 				break
 			}
-			valBytes = db.data[h.ValOff : h.ValOff+uint64(h.ValLen)]
 		}
-		if calcCRC(h.Flags, h.KeyLen, h.ValLen, h.ValOff, keyBytes, valBytes) != h.CRC32 {
-			debugLog("db.go:Recover", "break: CRC mismatch", map[string]interface{}{"off": off, "key": string(keyBytes), "flags": h.Flags, "recordsApplied": recordsApplied}, "B")
+		if calcCRC(h.Flags, h.KeyLen, h.ValLen, h.ValOff, keyBytes) != h.CRC32 {
 			break
 		}
-		if h.ValOff < minValOff {
+		if h.Flags == msg.FlagPut && h.ValOff < minValOff {
 			minValOff = h.ValOff
 		}
 		// 校验通过，更新索引
@@ -200,26 +174,25 @@ func (db *DB) Recover() error {
 			}
 			db.MarkUsed(h.ValOff) //标记占用真相
 			shard.idx[k] = Entry{ValOff: h.ValOff, ValLen: h.ValLen}
-			recordsApplied++
 		case msg.FlagDel:
 			if hadOld {
 				db.FreeBlock(oldEntity.ValOff, oldEntity.ValLen)
 			}
 			delete(shard.idx, k)
-			recordsApplied++
 		default:
-			debugLog("db.go:Recover", "unknown Flags, break", map[string]interface{}{"off": off, "flags": h.Flags, "key": k, "recordsApplied": recordsApplied}, "A")
-			break //未知flag
+			break Loop //未知flag
 		}
 		off += recordLen
 	}
 	db.logEnd = off
 	db.valEnd = minValOff
-	debugLog("db.go:Recover", "Recover done", map[string]interface{}{"logEnd": off, "valEnd": minValOff, "recordsApplied": recordsApplied, "fileLimit": fileLimit}, "E")
 	return nil
 }
 
 func (db *DB) Set(key string, value []byte) error {
+	if db.data == nil {
+		return msg.ErrClosed
+	}
 	if len(key) == 0 || len(key) > int(^uint16(0)) {
 		return msg.ErrBadArgument
 	}
@@ -267,8 +240,7 @@ func (db *DB) Set(key string, value []byte) error {
 		uint16(keyLen),
 		valueLen,
 		valOff,
-		db.data[keyStart:keyEnd],
-		db.data[valOff:valOff+uint64(valueLen)])
+		db.data[keyStart:keyEnd])
 	binary.LittleEndian.PutUint32(db.data[off+24:off+28], crc)
 	// （可选）为了 crash 测试更稳定，可以强刷一下
 	// _ = unix.Msync(db.data[off:off+recTotal], unix.MS_SYNC)
@@ -290,6 +262,11 @@ func (db *DB) Set(key string, value []byte) error {
 }
 
 func (db *DB) Get(key string) ([]byte, bool, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.data == nil {
+		return nil, false, msg.ErrClosed
+	}
 	sid := util.Str2Int(key, msg.ShardSize)
 	shard := &db.shards[sid]
 	shard.rw.RLock()
@@ -302,7 +279,6 @@ func (db *DB) Get(key string) ([]byte, bool, error) {
 	start := e.ValOff
 	end := start + uint64(e.ValLen)
 	if end > uint64(len(db.data)) || start < db.valEnd {
-		debugLog("db.go:Get", "ErrNoSpace: val bounds reject", map[string]interface{}{"key": key, "start": start, "end": end, "valEnd": db.valEnd, "dataLen": len(db.data), "condEnd": end > uint64(len(db.data)), "condStart": start < db.valEnd}, "E")
 		return nil, false, msg.ErrNoSpace // 或 ErrCorrupt
 	}
 	//拷贝返回，避免调用方误改 mmap 区
@@ -311,6 +287,9 @@ func (db *DB) Get(key string) ([]byte, bool, error) {
 }
 
 func (db *DB) Del(key string) error {
+	if db.data == nil {
+		return msg.ErrClosed
+	}
 	if len(key) == 0 || len(key) > int(^uint16(0)) {
 		return msg.ErrBadArgument
 	}
@@ -348,8 +327,7 @@ func (db *DB) Del(key string) error {
 		h.KeyLen,
 		0,
 		0,
-		keyBytes,
-		nil)
+		keyBytes)
 	binary.LittleEndian.PutUint32(db.data[off+24:off+28], crc)
 	//（可选）为了 crash 测试更稳定，可以强刷一下
 	//_ = unix.Msync(db.data[off:off+recTotal], unix.MS_SYNC)

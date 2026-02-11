@@ -3,9 +3,21 @@ package main
 import (
 	"fmt"
 	"md_master/core"
-	"md_master/to"
 	"sync"
 )
+
+type Player struct {
+	ID   uint64
+	HP   uint32
+	MP   uint32
+	Name [32]byte
+}
+
+func NewPlayer(id uint64, hp, mp uint32, name string) *Player {
+	p := Player{ID: id, HP: hp, MP: mp}
+	copy(p.Name[:], []byte(name))
+	return &p
+}
 
 func main() {
 	db, _ := core.Open("./struct.data", 1<<20)
@@ -14,14 +26,14 @@ func main() {
 	var wg sync.WaitGroup
 	addPlayer := func() {
 		for i := 0; i < 1000; i++ {
-			_ = core.SetFixed(db, fmt.Sprintf("player:%d", i), to.NewPlayer(uint64(i), uint32(i), uint32(i), fmt.Sprintf("player%d", i)))
+			_ = core.SetFixed(db, fmt.Sprintf("player:%d", i), NewPlayer(uint64(i), uint32(i), uint32(i), fmt.Sprintf("player%d", i)))
 
 		}
 		wg.Done()
 	}
 	addMaster := func() {
 		for i := 0; i < 1000; i++ {
-			_ = core.SetFixed(db, fmt.Sprintf("master:%d", i), to.NewPlayer(uint64(i), uint32(i), uint32(i), fmt.Sprintf("master%d", i)))
+			_ = core.SetFixed(db, fmt.Sprintf("master:%d", i), NewPlayer(uint64(i), uint32(i), uint32(i), fmt.Sprintf("master%d", i)))
 
 		}
 		wg.Done()
@@ -32,7 +44,7 @@ func main() {
 	wg.Wait()
 
 	for i := 0; i < 1000; i++ {
-		got, ok, _ := core.GetFixed[to.Player](db, fmt.Sprintf("player:%d", i))
+		got, ok, _ := core.GetFixed[Player](db, fmt.Sprintf("player:%d", i))
 		if !ok {
 			break
 		}
@@ -40,7 +52,7 @@ func main() {
 	}
 
 	for i := 0; i < 1000; i++ {
-		got, ok, _ := core.GetFixed[to.Player](db, fmt.Sprintf("master:%d", i))
+		got, ok, _ := core.GetFixed[Player](db, fmt.Sprintf("master:%d", i))
 		if !ok {
 			break
 		}

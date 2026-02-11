@@ -40,7 +40,7 @@ func encodeHeader(b []byte, h header) {
 	binary.LittleEndian.PutUint32(b[24:28], h.CRC32)
 }
 
-func calcCRC(flags uint16, keyLen uint16, valLen uint32, valOff uint64, key, val []byte) uint32 {
+func calcCRC(flags uint16, keyLen uint16, valLen uint32, valOff uint64, key []byte) uint32 {
 	// 把一部分头字段 + key + val 做校验 ；注意：不要把 Magic/Ver/CRC 自己算进去也行，但必须读写一致
 	var tmp [2 + 2 + 4 + 8]byte
 	binary.LittleEndian.PutUint16(tmp[0:2], flags)
@@ -51,6 +51,5 @@ func calcCRC(flags uint16, keyLen uint16, valLen uint32, valOff uint64, key, val
 	c := crc32.NewIEEE()
 	_, _ = c.Write(tmp[:])
 	_, _ = c.Write(key)
-	_, _ = c.Write(val)
 	return c.Sum32()
 }
