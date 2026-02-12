@@ -6,11 +6,10 @@ import (
 	"md_master/util"
 	"os"
 	"sync"
-
-	"golang.org/x/sys/unix"
 )
 
 type Entry struct {
+	SegID  uint32
 	ValOff uint64
 	ValLen uint32
 }
@@ -20,55 +19,57 @@ type shard struct {
 }
 
 type DB struct {
-	f    *os.File
-	data []byte
+	lifeMu  sync.RWMutex // 保护 segs｜Mmap 生命周期，Get 持 RLock，Close 持 Lock
+	writeMu sync.Mutex   // 串行化 Set/Del/Recover/Close
 
-	logEnd uint64
-	valEnd uint64
+	base    string
+	segSize int64
 
-	mu     sync.RWMutex
+	segs   []*Segment
 	shards []shard
-
-	free  map[uint32][]uint64 // size class -> offsets
-	truth map[uint64]uint32   // offset -> size class
 }
 
-func NewDB(f *os.File, data []byte, shardN int64) *DB {
+func NewDB(base string, segSize int64, shardN int) *DB {
 	shards := make([]shard, shardN)
 	for i := range shards {
 		shards[i].idx = make(map[string]Entry)
-		shards[i].rw = sync.RWMutex{}
 	}
 	return &DB{
-		f:      f,
-		data:   data,
-		mu:     sync.RWMutex{},
-		shards: shards,
-		free:   make(map[uint32][]uint64),
-		truth:  make(map[uint64]uint32),
-		logEnd: 0,
-		valEnd: uint64(len(data)),
+		base:    base,
+		segSize: segSize,
+		segs:    make([]*Segment, 0, 4),
+		shards:  shards,
 	}
 }
 
-// Open 打开/创建文件 + mmap + Recover （必须单线程访问，全局共享实例！！！！！！）
-func Open(path string, size int64) (*DB, error) {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		return nil, err
+func Open(base string, segSize int64) (*DB, error) {
+	db := NewDB(base, segSize, msg.ShardSize)
+	for id := uint32(0); ; id++ {
+		p := util.SegPath(base, id)
+		// 发现已有 segment
+		if _, err := os.Stat(p); err != nil {
+			if os.IsNotExist(err) {
+				break
+			}
+			return nil, err
+		}
+		// 打开 segment
+		seg, err := OpenSegment(p, id, segSize, false)
+		if err != nil {
+			return nil, err
+		}
+		db.segs = append(db.segs, seg)
 	}
-	err = f.Truncate(size)
-	if err != nil {
-		_ = f.Close()
-		return nil, err
+	// 没有 segment 时，创建第一个
+	if len(db.segs) == 0 {
+		p := util.SegPath(base, 0)
+		seg, err := OpenSegment(p, 0, segSize, true)
+		if err != nil {
+			return nil, err
+		}
+		db.segs = append(db.segs, seg)
 	}
-	data, err := unix.Mmap(int(f.Fd()), 0, int(size), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
-	if err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-	//初始化DB
-	db := NewDB(f, data, msg.ShardSize)
+
 	if err := db.Recover(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -78,81 +79,103 @@ func Open(path string, size int64) (*DB, error) {
 
 // Close 关闭文件 + 取消映射
 func (db *DB) Close() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	var err error
-	if db.data != nil {
-		if e := unix.Msync(db.data, unix.MS_SYNC); err == nil {
-			err = e
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
+	db.lifeMu.Lock()
+	defer db.lifeMu.Unlock()
+	var firstErr error
+	for _, seg := range db.segs {
+		if seg == nil {
+			continue
 		}
-		if e := unix.Munmap(db.data); err == nil {
-			err = e
+		if err := seg.Close(); err != nil && firstErr == nil {
+			firstErr = err
 		}
-		db.data = nil
 	}
-	if db.f != nil {
-		if e := db.f.Close(); err == nil {
-			err = e
-		}
-		db.f = nil
-	}
-
-	db.free = nil
-	db.truth = nil
+	db.segs = nil
 	db.shards = nil
-	return err
+	return firstErr
 }
 
-// Recover 恢复索引，更新logEnd、valEnd
+// ApnSeg 追加 segment,只在写路径里触发：必须拿 lifeMu 写锁
+func (db *DB) ApnSeg(base string, segSize int64) (*Segment, error) {
+	id := uint32(len(db.segs))
+	p := util.SegPath(base, id)
+	seg, err := OpenSegment(p, id, segSize, true)
+	if err != nil {
+		return nil, err
+	}
+	db.segs = append(db.segs, seg)
+	return seg, nil
+}
+
+// lastSeg 返回最后一个 segment，拿writeMu或者lifeMu读锁
+func (db *DB) lastSeg() *Segment {
+	if len(db.segs) == 0 {
+		return nil
+	}
+	return db.segs[len(db.segs)-1]
+}
+
 func (db *DB) Recover() error {
-	if db.free == nil {
-		db.free = make(map[uint32][]uint64)
-	} else {
-		for k := range db.free {
-			delete(db.free, k)
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
+	// 清空 idx（Recover 后 idx 以磁盘为准）
+	for i := range db.shards {
+		sh := &db.shards[i]
+		sh.rw.Lock()
+		for k := range sh.idx {
+			delete(sh.idx, k)
+		}
+		sh.rw.Unlock()
+	}
+	if len(db.segs) == 0 {
+		return nil
+	}
+	lastID := db.segs[len(db.segs)-1].id
+	// 逐段扫
+	for _, seg := range db.segs {
+		// 只有最后段需要 freelist/truth
+		if seg.id == lastID {
+			// 清 allocator 状态
+			for k := range seg.free {
+				delete(seg.free, k)
+			}
+			for k := range seg.truth {
+				delete(seg.truth, k)
+			}
+		}
+		if err := db.recoverOne(seg, lastID); err != nil {
+			return err
 		}
 	}
-	if db.truth == nil {
-		db.truth = make(map[uint64]uint32)
-	} else {
-		for k := range db.truth {
-			delete(db.truth, k)
-		}
-	}
-	var off uint64 = 0
-	fileLimit := uint64(len(db.data))
+	return nil
+}
+
+func (db *DB) recoverOne(seg *Segment, lastID uint32) error {
+	off := uint64(0)
+	fileLimit := uint64(len(seg.data))
 	minValOff := fileLimit
 Loop:
 	for {
-		//不够一个记录头
 		if off+msg.HeaderSize > minValOff {
 			break
 		}
-		h := decodeHeader(db.data[off : off+msg.HeaderSize])
-		//校验头
-		if h.Magic != msg.Magic {
+		h := decodeHeader(seg.data[off : off+msg.HeaderSize])
+		if h.Magic != msg.Magic || h.Ver != msg.Version || h.KeyLen == 0 {
 			break
 		}
-		if h.Ver != msg.Version {
+		recLen := uint64(msg.HeaderSize) + uint64(h.KeyLen)
+		if off+recLen > minValOff {
 			break
 		}
-		//长度校验
-		if h.KeyLen == 0 {
-			break
-		}
-		recordLen := uint64(msg.HeaderSize) + uint64(h.KeyLen)
-		if off+recordLen > minValOff {
-			break
-		}
-		//校验CRC
 		keyStart := off + msg.HeaderSize
-		keyBytes := db.data[keyStart : keyStart+uint64(h.KeyLen)]
+		keyBytes := seg.data[keyStart : keyStart+uint64(h.KeyLen)]
 		if h.Flags == msg.FlagPut {
 			if h.ValOff > fileLimit || uint64(h.ValLen) > fileLimit || h.ValOff+uint64(h.ValLen) > fileLimit {
 				break
 			}
-			if h.ValOff < off+recordLen {
+			if h.ValOff < off+recLen { // value 不能落在 log 记录内部
 				break
 			}
 		}
@@ -162,152 +185,160 @@ Loop:
 		if h.Flags == msg.FlagPut && h.ValOff < minValOff {
 			minValOff = h.ValOff
 		}
-		// 校验通过，更新索引
 		k := string(keyBytes)
 		sid := util.Str2Int(k, msg.ShardSize)
-		shard := &db.shards[sid]
-		oldEntity, hadOld := shard.idx[k]
+		sh := &db.shards[sid]
+		old, hadOld := sh.idx[k]
 		switch h.Flags {
+		// 只回收“最后段内部”的旧值
 		case msg.FlagPut:
-			if hadOld {
-				db.FreeBlock(oldEntity.ValOff, oldEntity.ValLen)
+			if seg.id == lastID && hadOld && old.SegID == lastID {
+				seg.FreeBlock(old.ValOff, old.ValLen)
 			}
-			db.MarkUsed(h.ValOff) //标记占用真相
-			shard.idx[k] = Entry{ValOff: h.ValOff, ValLen: h.ValLen}
+			if seg.id == lastID {
+				seg.MarkUsed(h.ValOff)
+			}
+			sh.idx[k] = Entry{SegID: seg.id, ValOff: h.ValOff, ValLen: h.ValLen}
 		case msg.FlagDel:
-			if hadOld {
-				db.FreeBlock(oldEntity.ValOff, oldEntity.ValLen)
+			if seg.id == lastID && hadOld && old.SegID == lastID {
+				seg.FreeBlock(old.ValOff, old.ValLen)
 			}
-			delete(shard.idx, k)
+			delete(sh.idx, k)
 		default:
-			break Loop //未知flag
+			break Loop
 		}
-		off += recordLen
+		off += recLen
 	}
-	db.logEnd = off
-	db.valEnd = minValOff
+	seg.logEnd = off
+	seg.valEnd = minValOff
 	return nil
 }
 
 func (db *DB) Set(key string, value []byte) error {
-	if db.data == nil {
-		return msg.ErrClosed
-	}
 	if len(key) == 0 || len(key) > int(^uint16(0)) {
 		return msg.ErrBadArgument
 	}
+	if len(value) == 0 || len(value) > int(^uint32(0)) {
+		return msg.ErrBadArgument
+	}
 	keyLen := len(key)
-	valueLen := uint32(len(value))
-	if keyLen > int(^uint16(0)) || len(value) > int(^uint32(0)) {
-		return msg.ErrBadArgument
-	}
-	if valueLen == 0 {
-		return msg.ErrBadArgument
-	}
+	valLen := uint32(len(value))
 	recTotal := uint64(msg.HeaderSize) + uint64(keyLen)
 
-	//写value入value区
-	db.mu.Lock()
-	var valOff uint64
-	off, ok := db.Alloc(valueLen, recTotal)
-	if !ok {
-		db.mu.Unlock()
-		return msg.ErrNoSpace
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
+	//写value
+	seg := db.lastSeg()
+	if seg == nil || seg.data == nil {
+		return msg.ErrClosed
 	}
-	valOff = off
-	copy(db.data[valOff:valOff+uint64(valueLen)], value)
-
-	//追加log record进log区
-	off = db.logEnd
-	//写log Header
+	valOff, ok := seg.Alloc(valLen, recTotal)
+	if !ok {
+		// 扩容：append 新段（需要 lifeMu.Lock，保护 segs slice 给 Get 用）
+		db.lifeMu.Lock()
+		newSeg, err := db.ApnSeg(db.base, db.segSize)
+		db.lifeMu.Unlock()
+		if err != nil {
+			return err
+		}
+		seg = newSeg
+		valOff, ok = seg.Alloc(valLen, recTotal)
+		if !ok {
+			return msg.ErrNoSpace
+		}
+	}
+	copy(seg.data[valOff:valOff+uint64(valLen)], value)
+	// 追加 log（写在同一个 seg 的 log 区）
+	off := seg.logEnd
 	h := header{
 		Magic:  msg.Magic,
 		Ver:    msg.Version,
 		Flags:  msg.FlagPut,
 		KeyLen: uint16(keyLen),
-		ValLen: valueLen,
+		ValLen: valLen,
 		ValOff: valOff,
 		CRC32:  0,
 	}
-	encodeHeader(db.data[off:off+msg.HeaderSize], h)
-	//写keyBytes
+	encodeHeader(seg.data[off:off+msg.HeaderSize], h)
 	keyStart := off + msg.HeaderSize
 	keyEnd := keyStart + uint64(h.KeyLen)
-	copy(db.data[keyStart:keyStart+uint64(h.KeyLen)], key)
-	//回写crc
-	crc := calcCRC(
-		msg.FlagPut,
-		uint16(keyLen),
-		valueLen,
-		valOff,
-		db.data[keyStart:keyEnd])
-	binary.LittleEndian.PutUint32(db.data[off+24:off+28], crc)
-	// （可选）为了 crash 测试更稳定，可以强刷一下
-	// _ = unix.Msync(db.data[off:off+recTotal], unix.MS_SYNC)
-	db.logEnd += recTotal
+	copy(seg.data[keyStart:keyEnd], key)
 
-	//更新idx
+	crc := calcCRC(msg.FlagPut, uint16(keyLen), valLen, valOff, seg.data[keyStart:keyEnd])
+	binary.LittleEndian.PutUint32(seg.data[off+24:off+28], crc)
+	seg.logEnd += recTotal
+
+	// 更新 idx（覆盖旧值只回收本段）
 	sid := util.Str2Int(key, msg.ShardSize)
-	shard := &db.shards[sid]
-	shard.rw.Lock()
-	oldEntity, hadOld := shard.idx[key]
-	if hadOld { //释放该key旧value的内存
-		db.FreeBlock(oldEntity.ValOff, oldEntity.ValLen)
+	sh := &db.shards[sid]
+	sh.rw.Lock()
+	old, hadOld := sh.idx[key]
+	if hadOld && old.SegID == seg.id {
+		seg.FreeBlock(old.ValOff, old.ValLen)
 	}
-	shard.idx[key] = Entry{ValOff: valOff, ValLen: valueLen}
-	shard.rw.Unlock()
-	db.mu.Unlock()
-
+	sh.idx[key] = Entry{SegID: seg.id, ValOff: valOff, ValLen: valLen}
+	sh.rw.Unlock()
 	return nil
 }
 
 func (db *DB) Get(key string) ([]byte, bool, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	if db.data == nil {
+	db.lifeMu.RLock()
+	defer db.lifeMu.RUnlock()
+	if len(db.segs) == 0 {
 		return nil, false, msg.ErrClosed
 	}
+
 	sid := util.Str2Int(key, msg.ShardSize)
 	shard := &db.shards[sid]
 	shard.rw.RLock()
-	defer shard.rw.RUnlock()
-
 	e, ok := shard.idx[key]
+	shard.rw.RUnlock()
 	if !ok {
 		return nil, false, nil
 	}
+	if int(e.SegID) >= len(db.segs) {
+		return nil, false, msg.ErrCorrupt
+	}
+	//取kv所在segment
+	seg := db.segs[e.SegID]
+	if seg == nil || seg.data == nil {
+		return nil, false, msg.ErrClosed
+	}
 	start := e.ValOff
 	end := start + uint64(e.ValLen)
-	if end > uint64(len(db.data)) || start < db.valEnd {
-		return nil, false, msg.ErrNoSpace // 或 ErrCorrupt
+	if end > uint64(len(seg.data)) {
+		return nil, false, msg.ErrCorrupt
 	}
-	//拷贝返回，避免调用方误改 mmap 区
-	v := append([]byte(nil), db.data[start:end]...)
+	//分配堆内存，拷贝传出
+	v := append([]byte(nil), seg.data[start:end]...)
 	return v, true, nil
 }
 
 func (db *DB) Del(key string) error {
-	if db.data == nil {
-		return msg.ErrClosed
-	}
 	if len(key) == 0 || len(key) > int(^uint16(0)) {
 		return msg.ErrBadArgument
 	}
-	keyLen := len(key)
-	if keyLen > int(^uint16(0)) {
-		return msg.ErrBadArgument
-	}
-	recTotal := uint64(msg.HeaderSize) + uint64(keyLen)
+	recTotal := uint64(msg.HeaderSize) + uint64(len(key))
 
-	db.mu.Lock()
-	if db.logEnd+recTotal > db.valEnd {
-		db.mu.Unlock()
-		return msg.ErrNoSpace
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
+
+	seg := db.lastSeg()
+	if seg == nil || seg.data == nil {
+		return msg.ErrClosed
 	}
 
-	//追加log record 进log区
-	off := db.logEnd
-	//写log Header
+	// del 只需要 log 空间；不够就扩容
+	if seg.logEnd+recTotal > seg.valEnd {
+		db.lifeMu.Lock()
+		newSeg, err := db.ApnSeg(db.base, db.segSize)
+		db.lifeMu.Unlock()
+		if err != nil {
+			return err
+		}
+		seg = newSeg
+	}
+	off := seg.logEnd
 	h := header{
 		Magic:  msg.Magic,
 		Ver:    msg.Version,
@@ -318,86 +349,22 @@ func (db *DB) Del(key string) error {
 		CRC32:  0,
 	}
 	keyStart := off + msg.HeaderSize
-	encodeHeader(db.data[off:keyStart], h)
-	//写keyBytes
-	copy(db.data[keyStart:keyStart+uint64(h.KeyLen)], key)
-	keyBytes := db.data[keyStart : keyStart+uint64(h.KeyLen)]
-	crc := calcCRC(
-		msg.FlagDel,
-		h.KeyLen,
-		0,
-		0,
-		keyBytes)
-	binary.LittleEndian.PutUint32(db.data[off+24:off+28], crc)
-	//（可选）为了 crash 测试更稳定，可以强刷一下
-	//_ = unix.Msync(db.data[off:off+recTotal], unix.MS_SYNC)
-	db.logEnd += recTotal
+	encodeHeader(seg.data[off:keyStart], h)
+	copy(seg.data[keyStart:keyStart+uint64(h.KeyLen)], key)
+	keyBytes := seg.data[keyStart : keyStart+uint64(h.KeyLen)]
+	crc := calcCRC(msg.FlagDel, h.KeyLen, 0, 0, keyBytes)
+	binary.LittleEndian.PutUint32(seg.data[off+24:off+28], crc)
+	seg.logEnd += recTotal
 
-	//释放旧value内存
 	sid := util.Str2Int(key, msg.ShardSize)
-	shard := &db.shards[sid]
-	shard.rw.Lock()
-	oldEntity, hadOld := shard.idx[key]
-	if hadOld { //释放该key旧value的内存
-		db.FreeBlock(oldEntity.ValOff, oldEntity.ValLen)
+	sh := &db.shards[sid]
+	sh.rw.Lock()
+	old, hadOld := sh.idx[key]
+	if hadOld && old.SegID == seg.id {
+		seg.FreeBlock(old.ValOff, old.ValLen)
 	}
-	//删除索引
-	delete(shard.idx, key)
-	shard.rw.Unlock()
+	delete(sh.idx, key)
+	sh.rw.Unlock()
 
-	db.mu.Unlock()
 	return nil
-}
-
-// Alloc 分配内存，不命中空闲区则更新valEnd，必须在db.mu.Lock()保护下或单线程调用
-func (db *DB) Alloc(n uint32, logNeed uint64) (off uint64, ok bool) {
-	c := util.SizeClass(n)
-	if c == 0 {
-		return 0, false
-	}
-	// 1)查freelist
-	if db.logEnd+logNeed <= db.valEnd { //有空闲区
-		stack := db.free[c]
-		for len(stack) > 0 {
-			off = stack[len(stack)-1]
-			stack = stack[:len(stack)-1]
-			if cls, ok := db.truth[off]; ok && cls == c {
-				delete(db.truth, off)
-				db.free[c] = stack
-				return off, true
-			}
-		}
-		db.free[c] = stack
-	} else {
-		return 0, false
-	}
-	// tail 分配
-	need := uint64(c)
-	if db.valEnd < need {
-		return 0, false
-	}
-	newValEnd := db.valEnd - need
-	if db.logEnd+logNeed > newValEnd {
-		return 0, false
-	}
-	db.valEnd = newValEnd
-	return db.valEnd, true
-}
-
-// FreeBlock 释放块内存，加入空闲区，必须在db.mu.Lock()保护下或单线程调用
-func (db *DB) FreeBlock(off uint64, n uint32) {
-	c := util.SizeClass(n)
-	if c == 0 {
-		return
-	}
-	if cls, ok := db.truth[off]; ok && cls == c {
-		return // 已经 free 过了，拒绝 double-free
-	}
-	db.truth[off] = c
-	db.free[c] = append(db.free[c], off)
-}
-
-// MarkUsed 标记内存已使用，必须在db.mu.Lock()保护下或单线程调用
-func (db *DB) MarkUsed(off uint64) {
-	delete(db.truth, off)
 }

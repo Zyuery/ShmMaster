@@ -1,7 +1,8 @@
-package core
+package client
 
 import (
 	"fmt"
+	"md_master/core"
 	"reflect"
 	"unsafe"
 )
@@ -50,14 +51,14 @@ func bytesViewOf[T any](p *T) []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(p)), n)
 }
 
-func SetFixed[T any](db *DB, key string, v *T) error {
+func SetFixed[T any](db *core.DB, key string, v *T) error {
 	if err := assertNoPointers[T](); err != nil {
 		return err
 	}
 	return db.Set(key, bytesViewOf(v))
 }
 
-func GetFixed[T any](db *DB, key string) (*T, bool, error) {
+func GetFixed[T any](db *core.DB, key string) (*T, bool, error) {
 	if err := assertNoPointers[T](); err != nil {
 		return nil, false, err
 	}

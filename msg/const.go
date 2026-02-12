@@ -10,7 +10,7 @@ const (
 )
 
 const (
-	ShardSize = 32
+	ShardSize = 256
 )
 
 const (
