@@ -2,11 +2,11 @@ package engine
 
 import (
 	"encoding/binary"
+	"md_master/consts"
 	"md_master/internal/errs"
 	"md_master/internal/index"
 	"md_master/internal/record"
 	"md_master/internal/segment"
-	"md_master/msg"
 )
 
 func (db *DB) lastSeg() *segment.Segment {
@@ -22,7 +22,7 @@ func (db *DB) Set(key string, value []byte) error {
 	}
 	keyLen := len(key)
 	valLen := uint32(len(value))
-	recTotal := uint64(msg.HeaderSize) + uint64(keyLen)
+	recTotal := uint64(consts.HeaderSize) + uint64(keyLen)
 
 	db.writeMu.Lock()
 	defer db.writeMu.Unlock()
@@ -48,19 +48,19 @@ func (db *DB) Set(key string, value []byte) error {
 	copy(data[valOff:valOff+uint64(valLen)], value)
 	off := seg.LogEnd()
 	h := record.Header{
-		Magic:  msg.Magic,
-		Ver:    msg.Version,
-		Flags:  msg.FlagPut,
+		Magic:  consts.Magic,
+		Ver:    consts.Version,
+		Flags:  consts.FlagPut,
 		KeyLen: uint16(keyLen),
 		ValLen: valLen,
 		ValOff: valOff,
 		CRC32:  0,
 	}
-	record.EncodeHeader(data[off:off+msg.HeaderSize], h)
-	keyStart := off + msg.HeaderSize
+	record.EncodeHeader(data[off:off+consts.HeaderSize], h)
+	keyStart := off + consts.HeaderSize
 	keyEnd := keyStart + uint64(h.KeyLen)
 	copy(data[keyStart:keyEnd], key)
-	crc := record.CalcCRC(msg.FlagPut, uint16(keyLen), valLen, valOff, data[keyStart:keyEnd])
+	crc := record.CalcCRC(consts.FlagPut, uint16(keyLen), valLen, valOff, data[keyStart:keyEnd])
 	binary.LittleEndian.PutUint32(data[off+24:off+28], crc)
 	seg.SetLogEnd(off + recTotal)
 
@@ -103,7 +103,7 @@ func (db *DB) Del(key string) error {
 	if len(key) == 0 || len(key) > int(^uint16(0)) {
 		return errs.ErrBadArgument
 	}
-	recTotal := uint64(msg.HeaderSize) + uint64(len(key))
+	recTotal := uint64(consts.HeaderSize) + uint64(len(key))
 
 	db.writeMu.Lock()
 	defer db.writeMu.Unlock()
@@ -123,19 +123,19 @@ func (db *DB) Del(key string) error {
 	data := seg.GetData()
 	off := seg.LogEnd()
 	h := record.Header{
-		Magic:  msg.Magic,
-		Ver:    msg.Version,
-		Flags:  msg.FlagDel,
+		Magic:  consts.Magic,
+		Ver:    consts.Version,
+		Flags:  consts.FlagDel,
 		KeyLen: uint16(len(key)),
 		ValLen: 0,
 		ValOff: 0,
 		CRC32:  0,
 	}
-	keyStart := off + msg.HeaderSize
+	keyStart := off + consts.HeaderSize
 	record.EncodeHeader(data[off:keyStart], h)
 	copy(data[keyStart:keyStart+uint64(h.KeyLen)], key)
 	keyBytes := data[keyStart : keyStart+uint64(h.KeyLen)]
-	crc := record.CalcCRC(msg.FlagDel, h.KeyLen, 0, 0, keyBytes)
+	crc := record.CalcCRC(consts.FlagDel, h.KeyLen, 0, 0, keyBytes)
 	binary.LittleEndian.PutUint32(data[off+24:off+28], crc)
 	seg.SetLogEnd(off + recTotal)
 

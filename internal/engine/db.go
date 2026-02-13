@@ -1,9 +1,9 @@
 package engine
 
 import (
+	"md_master/consts"
 	"md_master/internal/index"
 	"md_master/internal/segment"
-	"md_master/msg"
 	"sync"
 )
 
@@ -29,7 +29,7 @@ func NewDB(base string, segSize int64, shardN int) *DB {
 
 // Open 打开或创建 DB
 func Open(base string, segSize int64) (*DB, error) {
-	db := NewDB(base, segSize, msg.ShardSize)
+	db := NewDB(base, segSize, consts.ShardSize)
 	if err := db.segMgr.OpenBase(); err != nil {
 		return nil, err
 	}

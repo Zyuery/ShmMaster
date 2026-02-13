@@ -3,7 +3,6 @@ package segment
 import (
 	"fmt"
 	"md_master/internal/mmap"
-	"md_master/util"
 	"os"
 )
 
@@ -90,7 +89,7 @@ func OpenSegment(path string, id uint32, segSize int64, create bool) (*Segment, 
 
 // Alloc 分配 value 区块，不命中 freelist 则从尾部分配。
 func (s *Segment) Alloc(n uint32, logNeed uint64) (off uint64, ok bool) {
-	c := util.SizeClass(n)
+	c := SizeClass(n)
 	if c == 0 {
 		return 0, false
 	}
@@ -123,7 +122,7 @@ func (s *Segment) Alloc(n uint32, logNeed uint64) (off uint64, ok bool) {
 
 // FreeBlock 释放块并加入 freelist；double-free 忽略。
 func (s *Segment) FreeBlock(off uint64, n uint32) {
-	c := util.SizeClass(n)
+	c := SizeClass(n)
 	if c == 0 {
 		return
 	}

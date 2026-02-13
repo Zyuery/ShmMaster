@@ -1,8 +1,7 @@
 package index
 
 import (
-	"md_master/msg"
-	"md_master/util"
+	"md_master/consts"
 	"sync"
 )
 
@@ -26,7 +25,7 @@ func NewSharded(shardNum int) *Sharded {
 }
 
 func (s *Sharded) shard(key string) *shard {
-	i := util.Str2Int(key, msg.ShardSize)
+	i := Str2Int(key, consts.ShardSize)
 	return &s.shards[i]
 }
 

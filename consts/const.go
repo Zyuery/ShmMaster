@@ -1,4 +1,4 @@
-package msg
+package consts
 
 // Header Const
 const (
