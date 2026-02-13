@@ -1,11 +1,16 @@
-package client
+package fixed
 
 import (
 	"fmt"
-	"md_master/core"
 	"reflect"
 	"unsafe"
 )
+
+// Storager 供 SetFixed/GetFixed 使用的存储接口。
+type Storager interface {
+	Set(key string, value []byte) error
+	Get(key string) ([]byte, bool, error)
+}
 
 func assertNoPointers[T any]() error {
 	var zero T
@@ -27,7 +32,6 @@ func typeNoPointers(t reflect.Type) error {
 			}
 		}
 		return nil
-	// 这些都可能携带指针 / 运行时对象
 	case reflect.String, reflect.Slice, reflect.Map, reflect.Pointer,
 		reflect.Interface, reflect.Func, reflect.Chan, reflect.UnsafePointer:
 		return fmt.Errorf("type %s contains pointer-like data", t.String())
@@ -36,29 +40,21 @@ func typeNoPointers(t reflect.Type) error {
 	}
 }
 
-// -------- struct <-> []byte（memcpy 语义） --------
 func bytesViewOf[T any](p *T) []byte {
-	// 1. 获取指针指向的变量占用的内存字节数
-	// unsafe.Sizeof(*p)：计算 *p（即指针指向的实际变量）的内存大小，返回 uintptr 类型
-	// int()：转换为 int 类型，因为切片长度需要 int 类型
 	n := int(unsafe.Sizeof(*p))
-
-	// 2. 核心转换逻辑
-	// unsafe.Pointer(p)：将类型化指针 *T 转换为通用的无类型指针
-	// (*byte)(...)：将无类型指针强制转换为 *byte 类型指针（字节指针）
-	// unsafe.Slice：基于字节指针和长度 n，创建一个字节切片
-	// 这个切片是原变量内存的"视图"，修改切片会直接修改原变量的内存
 	return unsafe.Slice((*byte)(unsafe.Pointer(p)), n)
 }
 
-func SetFixed[T any](db *core.DB, key string, v *T) error {
+// SetFixed 将无指针类型 T 的实例序列化写入 db。
+func SetFixed[T any](db Storager, key string, v *T) error {
 	if err := assertNoPointers[T](); err != nil {
 		return err
 	}
 	return db.Set(key, bytesViewOf(v))
 }
 
-func GetFixed[T any](db *core.DB, key string) (*T, bool, error) {
+// GetFixed 从 db 读出并反序列化为 *T。
+func GetFixed[T any](db Storager, key string) (*T, bool, error) {
 	if err := assertNoPointers[T](); err != nil {
 		return nil, false, err
 	}
@@ -71,7 +67,6 @@ func GetFixed[T any](db *core.DB, key string) (*T, bool, error) {
 	if len(b) != want {
 		return nil, false, fmt.Errorf("size mismatch: got=%d want=%d", len(b), want)
 	}
-
 	copy(bytesViewOf(out), b)
 	return out, true, nil
 }

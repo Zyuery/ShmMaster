@@ -1,4 +1,4 @@
-package msg
+package errs
 
 import "errors"
 
