@@ -99,6 +99,17 @@ func (db *DB) Get(key string) ([]byte, bool, error) {
 	return data[start:end], true, nil
 }
 
+func (db *DB) GetCopy(key string) ([]byte, bool, error) {
+	b, ok, err := db.Get(key)
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok {
+		return nil, false, nil
+	}
+	return append([]byte(nil), b...), true, nil
+}
+
 func (db *DB) Del(key string) error {
 	if len(key) == 0 || len(key) > int(^uint16(0)) {
 		return errs.ErrBadArgument

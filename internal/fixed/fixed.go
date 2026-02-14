@@ -66,5 +66,8 @@ func GetFixed[T any](db Storager, key string) (*T, bool, error) {
 	if len(b) != want {
 		return nil, false, fmt.Errorf("size mismatch: got=%d want=%d", len(b), want)
 	}
+	if len(b) == 0 {
+		return nil, false, nil
+	}
 	return (*T)(unsafe.Pointer(&b[0])), true, nil
 }
