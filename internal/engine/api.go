@@ -96,7 +96,7 @@ func (db *DB) Get(key string) ([]byte, bool, error) {
 	if end > uint64(len(data)) {
 		return nil, false, errs.ErrCorrupt
 	}
-	return append([]byte(nil), data[start:end]...), true, nil
+	return data[start:end], true, nil
 }
 
 func (db *DB) Del(key string) error {

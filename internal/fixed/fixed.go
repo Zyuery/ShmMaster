@@ -45,7 +45,7 @@ func bytesViewOf[T any](p *T) []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(p)), n)
 }
 
-// SetFixed 将无指针类型 T 的实例序列化写入 db。
+// SetFixed 将无指针类型 T 的实例写入 db。
 func SetFixed[T any](db Storager, key string, v *T) error {
 	if err := assertNoPointers[T](); err != nil {
 		return err
@@ -53,7 +53,7 @@ func SetFixed[T any](db Storager, key string, v *T) error {
 	return db.Set(key, bytesViewOf(v))
 }
 
-// GetFixed 从 db 读出并反序列化为 *T。
+// GetFixed 从 db 读出并为 *T。
 func GetFixed[T any](db Storager, key string) (*T, bool, error) {
 	if err := assertNoPointers[T](); err != nil {
 		return nil, false, err
@@ -62,11 +62,9 @@ func GetFixed[T any](db Storager, key string) (*T, bool, error) {
 	if err != nil || !ok {
 		return nil, ok, err
 	}
-	out := new(T)
-	want := int(unsafe.Sizeof(*out))
+	want := int(unsafe.Sizeof(*new(T)))
 	if len(b) != want {
 		return nil, false, fmt.Errorf("size mismatch: got=%d want=%d", len(b), want)
 	}
-	copy(bytesViewOf(out), b)
-	return out, true, nil
+	return (*T)(unsafe.Pointer(&b[0])), true, nil
 }
