@@ -2,11 +2,11 @@ package engine
 
 import (
 	"encoding/binary"
-	"md_master/consts"
-	"md_master/internal/errs"
-	"md_master/internal/index"
-	"md_master/internal/record"
-	"md_master/internal/segment"
+	"shm_master/consts"
+	"shm_master/internal/errs"
+	"shm_master/internal/index"
+	"shm_master/internal/record"
+	"shm_master/internal/segment"
 )
 
 func (db *DB) lastSeg() *segment.Segment {

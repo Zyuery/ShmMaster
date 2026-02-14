@@ -1,9 +1,9 @@
 package engine
 
 import (
-	"md_master/consts"
-	"md_master/internal/index"
-	"md_master/internal/segment"
+	"shm_master/consts"
+	"shm_master/internal/index"
+	"shm_master/internal/segment"
 	"sync"
 )
 

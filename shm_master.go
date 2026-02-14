@@ -1,8 +1,8 @@
 package shm_master
 
 import (
-	"md_master/internal/engine"
-	"md_master/internal/errs"
+	"shm_master/internal/engine"
+	"shm_master/internal/errs"
 )
 
 // 对外暴露的 sentinel errors，便于调用方 errors.Is。

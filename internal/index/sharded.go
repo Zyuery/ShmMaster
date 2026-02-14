@@ -1,7 +1,7 @@
 package index
 
 import (
-	"md_master/consts"
+	"shm_master/consts"
 	"sync"
 )
 

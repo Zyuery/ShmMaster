@@ -1,4 +1,4 @@
-module md_master
+module shm_master
 
 go 1.24.1
 

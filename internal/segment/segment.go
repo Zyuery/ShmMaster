@@ -2,8 +2,8 @@ package segment
 
 import (
 	"fmt"
-	"md_master/internal/mmap"
 	"os"
+	"shm_master/internal/mmap"
 )
 
 // Segment 单段：mmap 文件、log/value 边界、freelist。

@@ -1,8 +1,8 @@
 package segment
 
 import (
-	"md_master/internal/fs"
 	"os"
+	"shm_master/internal/fs"
 )
 
 // Manager 管理多段：按 base 扫描已有段、追加新段。

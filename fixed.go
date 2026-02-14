@@ -1,6 +1,6 @@
 package shm_master
 
-import "md_master/internal/fixed"
+import "shm_master/internal/fixed"
 
 // SetFixed 将无指针类型 T 的实例序列化写入 db。
 func SetFixed[T any](db *DB, key string, v *T) error {

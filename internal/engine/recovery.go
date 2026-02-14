@@ -1,10 +1,10 @@
 package engine
 
 import (
-	"md_master/consts"
-	"md_master/internal/index"
-	"md_master/internal/record"
-	"md_master/internal/segment"
+	"shm_master/consts"
+	"shm_master/internal/index"
+	"shm_master/internal/record"
+	"shm_master/internal/segment"
 )
 
 // Recover 重放所有段的 log，重建 index 并更新每段的 logEnd/valEnd。
